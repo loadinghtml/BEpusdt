@@ -1,11 +1,17 @@
-name: Build and Release
+name: Manual Release (UI Only)
+
 on:
   workflow_dispatch:
-  create:
-    branches:
-      - main
-    tags:
-      - v*
+    inputs:
+      tag_name:
+        description: '请输入版本号 (例如 v1.22.8)'
+        required: true
+        default: 'v1.0.0'
+
+# ⚠️ 必须权限：允许 Actions 删除/写入 Release 和 Tag
+permissions:
+  contents: write
+
 jobs:
   build-release:
     runs-on: ubuntu-latest
@@ -13,34 +19,82 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-      - name: Git Fetch Tags
-        run: git fetch --force --tags
+          fetch-depth: 0 # GoReleaser 需要完整历史
+
+      # ----------------------------------------------------------------
+      # 1. 前端构建部分
+      # ----------------------------------------------------------------
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '25'
+          node-version: '22'
+
       - name: Install pnpm
         run: npm install -g pnpm
+
       - name: Install frontend dependencies
         working-directory: ./web
         run: pnpm install --frozen-lockfile --shamefully-hoist
+
       - name: Build frontend
         working-directory: ./web
         run: pnpm run build:prod
+
       - name: Move frontend files to static/secure
         run: |
           mkdir -p static/secure
           cp -r web/dist/* static/secure/
+
+      # ----------------------------------------------------------------
+      # 2. Go 环境准备
+      # ----------------------------------------------------------------
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25.4'
+          go-version: 'stable'
+
+      # ----------------------------------------------------------------
+      # 3. [关键步骤] 清理旧 Release/Tag 并创建新 Tag
+      #    解决 "Tag exists" 和 "Validation Failed (already_exists)" 错误
+      # ----------------------------------------------------------------
+      - name: Delete Old Tag & Create New Tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ inputs.tag_name }}"
+          echo "🚀 正在处理版本: $TAG"
+
+          # 1. 配置 Git 身份
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 2. 尝试删除 GitHub 上的旧 Release 和 Tag (如果存在)
+          # --cleanup-tag 会自动删除远程 tag
+          # || true 保证如果 Release 不存在，脚本不会报错停止
+          echo "正在清理旧的 Release (如果有)..."
+          gh release delete $TAG --yes --cleanup-tag || echo "远程 Release/Tag 不存在，无需删除。"
+
+          # 3. 删除本地可能存在的旧 Tag (防止 fetch-depth:0 拉取了旧引用)
+          git tag -d $TAG 2>/dev/null || echo "本地 Tag 不存在，无需删除。"
+
+          # 4. 在当前 Commit 打上新 Tag
+          echo "打上新标签: $TAG"
+          git tag $TAG
+          
+          # 5. 推送新 Tag 到远程
+          git push origin $TAG
+          echo "✅ Tag $TAG 已准备就绪！"
+
+      # ----------------------------------------------------------------
+      # 4. 执行发布
+      # ----------------------------------------------------------------
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
           version: latest
-          args: release --clean --verbose
+          args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 强制 GoReleaser 使用我们在上一步创建的 Tag
+          GORELEASER_CURRENT_TAG: ${{ inputs.tag_name }}
